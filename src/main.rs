@@ -13,11 +13,19 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position},
     style::{Color, Style, Stylize},
-    widgets::{Block, BorderType, List, Paragraph, Widget},
+    widgets::{
+        Block, BorderType, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Widget, Wrap,
+    },
 };
 
 use reqwest::Method;
 use tokio::sync::mpsc;
+
+pub enum AppMessage {
+    RequestStarted,
+    RequestCompleted(HttpResponse),
+}
 
 mod text_input;
 
@@ -54,10 +62,12 @@ pub struct App<'a> {
     loading: bool,
     last_request_intsant: Instant,
     last_request_elapsed: Duration,
+    last_request_total: Duration,
+    response_scroll: u16,
     requests_history: Vec<(String, HttpResponse)>,
     rt: &'a tokio::runtime::Runtime,
-    rx: mpsc::UnboundedReceiver<HttpResponse>,
-    tx: mpsc::UnboundedSender<HttpResponse>,
+    rx: mpsc::UnboundedReceiver<AppMessage>,
+    tx: mpsc::UnboundedSender<AppMessage>,
 }
 
 impl<'a> App<'a> {
@@ -78,6 +88,8 @@ impl<'a> App<'a> {
             loading: false,
             last_request_intsant: Instant::now(),
             last_request_elapsed: Duration::ZERO,
+            last_request_total: Duration::ZERO,
+            response_scroll: 0,
             requests_history: Vec::new(),
             rt,
             rx,
@@ -87,13 +99,13 @@ impl<'a> App<'a> {
 
     fn send_request(&mut self, url: String) {
         self.loading = true;
-        self.last_request_intsant = Instant::now();
         self.response = None;
         let method = self.method.clone();
         let method_str = method.as_str().to_string();
         let tx = self.tx.clone();
         self.rt.spawn(async move {
             let client = reqwest::Client::new();
+            let _ = tx.send(AppMessage::RequestStarted);
             let now = Instant::now();
             let result = client.request(method, &url).send().await;
             let elapsed = now.elapsed();
@@ -115,23 +127,30 @@ impl<'a> App<'a> {
                     method_str,
                 },
             };
-            let _ = tx.send(resp);
+            let _ = tx.send(AppMessage::RequestCompleted(resp));
         });
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         while !self.exit {
-            // Check for completed HTTP responses
-            if let Ok(resp) = self.rx.try_recv() {
-                self.response = Some(resp);
-
-                self.requests_history.push((
-                    String::from(self.url_input.clone().input),
-                    self.response.clone().unwrap_or(self.empty_response()),
-                ));
-
-                self.loading = false;
-                self.last_request_elapsed = self.last_request_intsant.elapsed();
+            // Check for messages from async tasks
+            while let Ok(msg) = self.rx.try_recv() {
+                match msg {
+                    AppMessage::RequestStarted => {
+                        self.last_request_intsant = Instant::now();
+                    }
+                    AppMessage::RequestCompleted(resp) => {
+                        self.last_request_total = self.last_request_intsant.elapsed();
+                        self.last_request_elapsed = resp.elapsed;
+                        self.response_scroll = 0;
+                        self.response = Some(resp);
+                        self.requests_history.push((
+                            String::from(self.url_input.clone().input),
+                            self.response.clone().unwrap_or(self.empty_response()),
+                        ));
+                        self.loading = false;
+                    }
+                }
             }
 
             terminal.draw(|frame| self.render(frame))?;
@@ -206,8 +225,8 @@ impl<'a> App<'a> {
                         // URL input mode
                         match key_event.code {
                             KeyCode::Esc => self.url_input.blur(),
-                            code => {
-                                if self.url_input.handle_key_event(code) {
+                            _ => {
+                                if self.url_input.handle_key_event(key_event) {
                                     let url = self.url_input.value().to_string();
                                     if !url.is_empty() {
                                         self.send_request(url);
@@ -219,8 +238,8 @@ impl<'a> App<'a> {
                         // Body input mode
                         match key_event.code {
                             KeyCode::Esc => self.request_body_input.blur(),
-                            code => {
-                                self.request_body_input.handle_key_event(code);
+                            _ => {
+                                self.request_body_input.handle_key_event(key_event);
                             }
                         }
                     } else {
@@ -238,6 +257,7 @@ impl<'a> App<'a> {
                             KeyCode::Char('m') => self.switch_method(true),
                             KeyCode::Char('n') => self.switch_method(false),
                             KeyCode::Char('h') => self.help_window = !self.help_window,
+                            KeyCode::Char('c') => self.requests_history = vec![],
                             KeyCode::Right => {
                                 if self.left_section_w < 100 {
                                     self.left_section_w += 1;
@@ -257,6 +277,13 @@ impl<'a> App<'a> {
                                 if self.top_section_h > 0 {
                                     self.top_section_h -= 5;
                                 }
+                            }
+                            KeyCode::PageDown => {
+                                // TODO: fix infinite scroll
+                                self.response_scroll = self.response_scroll.saturating_add(2);
+                            }
+                            KeyCode::PageUp => {
+                                self.response_scroll = self.response_scroll.saturating_sub(2);
                             }
                             KeyCode::Enter => {
                                 let url = self.url_input.value().to_string();
@@ -355,11 +382,11 @@ impl Widget for &App<'_> {
             .iter()
             .map(|(k, v)| {
                 format!(
-                    "{}: {} - {} in {:.0?}",
+                    "{}: {} - {} in {:.0?}ms",
                     v.method_str,
                     self.format_short_url(k),
                     v.status,
-                    v.elapsed
+                    v.elapsed.as_millis()
                 )
             })
             .collect::<Vec<_>>();
@@ -382,6 +409,10 @@ impl Widget for &App<'_> {
             "press <b>      to input request body".bold().into(),
             "press <n>/<m>  to switch method back/forth".bold().into(),
             "press <enter>  to send request".bold().into(),
+            "press <c>      to clear history".bold().into(),
+            "press <pgup/dn> to scroll response"
+                .bold()
+                .into(),
             "press <esc>    to exit input mode"
                 .bold()
                 .light_red()
@@ -391,8 +422,11 @@ impl Widget for &App<'_> {
         .block(
             Block::bordered()
                 .title("Help")
+                .title_alignment(Alignment::Center)
+                .title_style(Style::new().yellow())
                 .border_type(BorderType::Double),
         )
+        .wrap(Wrap { trim: true })
         .alignment(Alignment::Left)
         .render(sidebar_layout[1], buf);
 
@@ -425,8 +459,8 @@ impl Widget for &App<'_> {
         } else {
             Style::default()
         };
-        Paragraph::new(self.url_input.input.as_str())
-            .style(url_style)
+        let sel_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+        Paragraph::new(self.url_input.styled_text(url_style, sel_style))
             .block(url_block)
             .render(url_and_method_layout[0], buf);
 
@@ -455,13 +489,17 @@ impl Widget for &App<'_> {
         } else {
             Style::default()
         };
+        let body_sel_style = Style::default().fg(Color::Black).bg(Color::Yellow);
 
-        Paragraph::new(self.request_body_input.input.as_str())
-            .style(body_style)
-            .block(request_body_block)
-            .render(control_layout[1], buf);
+        Paragraph::new(
+            self.request_body_input
+                .styled_text(body_style, body_sel_style),
+        )
+        .wrap(Wrap { trim: true })
+        .block(request_body_block)
+        .render(control_layout[1], buf);
 
-        let dot_or_not = if (self.last_request_elapsed.as_millis() / 120) % 2 == 0 {
+        let dot_or_not = if (self.last_request_elapsed.as_millis() / 125) % 2 == 0 {
             "."
         } else {
             " "
@@ -475,7 +513,12 @@ impl Widget for &App<'_> {
                 (self.last_request_elapsed.as_millis())
             )
         } else if let Some(ref resp) = self.response {
-            format!("Response in ({:.0?}) - [{}] ", resp.elapsed, resp.status,)
+            format!(
+                "Response [{}] — RTT {}ms | Total {}ms",
+                resp.status,
+                resp.elapsed.as_millis(),
+                self.last_request_total.as_millis()
+            )
         } else {
             "Response".to_string()
         };
@@ -495,8 +538,26 @@ impl Widget for &App<'_> {
             None => String::new(),
         };
 
+        let response_area = control_layout[2];
+        let content_lines = response_text.lines().count() as u16;
+        let visible_height = response_area.height.saturating_sub(2);
+
         Paragraph::new(response_text)
             .block(response_block)
-            .render(control_layout[2], buf);
+            .wrap(Wrap { trim: true })
+            .scroll((self.response_scroll, 0))
+            .render(response_area, buf);
+
+        if content_lines > visible_height {
+            let mut scrollbar_state = ScrollbarState::new(content_lines as usize)
+                .position(self.response_scroll as usize)
+                .viewport_content_length(visible_height as usize);
+            ratatui::widgets::StatefulWidget::render(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                response_area,
+                buf,
+                &mut scrollbar_state,
+            );
+        }
     }
 }
