@@ -1,5 +1,4 @@
 use std::{
-    ops::Index,
     str::FromStr,
     time::{Duration, Instant},
     vec,
@@ -50,8 +49,11 @@ pub struct App<'a> {
     url_input: TextInput,
     method: Method,
     method_i: usize,
+    request_body_input: TextInput,
     response: Option<HttpResponse>,
     loading: bool,
+    last_request_intsant: Instant,
+    last_request_elapsed: Duration,
     requests_history: Vec<(String, HttpResponse)>,
     rt: &'a tokio::runtime::Runtime,
     rx: mpsc::UnboundedReceiver<HttpResponse>,
@@ -64,13 +66,18 @@ impl<'a> App<'a> {
         Self {
             exit: false,
             left_section_w: 25,
-            top_section_h: 60,
+            top_section_h: 30,
             help_window: true,
-            url_input: TextInput::new(),
+            url_input: TextInput::new("https://dogapi.dog/api/v2/breeds".to_string()),
+            request_body_input: TextInput::new_multiline(
+                "{\n   \"id\": 1,\n   \"name\": \"boxy\"\n}".to_string(),
+            ),
             response: None,
             method: Method::GET,
             method_i: 0,
             loading: false,
+            last_request_intsant: Instant::now(),
+            last_request_elapsed: Duration::ZERO,
             requests_history: Vec::new(),
             rt,
             rx,
@@ -80,6 +87,7 @@ impl<'a> App<'a> {
 
     fn send_request(&mut self, url: String) {
         self.loading = true;
+        self.last_request_intsant = Instant::now();
         self.response = None;
         let method = self.method.clone();
         let method_str = method.as_str().to_string();
@@ -123,6 +131,7 @@ impl<'a> App<'a> {
                 ));
 
                 self.loading = false;
+                self.last_request_elapsed = self.last_request_intsant.elapsed();
             }
 
             terminal.draw(|frame| self.render(frame))?;
@@ -157,14 +166,44 @@ impl<'a> App<'a> {
                 input_area.y + 1,
             ));
         }
+
+        // Cursor positioning for body input
+        if self.request_body_input.focused {
+            let area = frame.area();
+            let main_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![
+                    Constraint::Percentage(self.left_section_w),
+                    Constraint::Percentage(100 - self.left_section_w),
+                ])
+                .split(area);
+            let control_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(vec![
+                    Constraint::Min(3),
+                    Constraint::Percentage(self.top_section_h),
+                    Constraint::Percentage(100 - self.top_section_h),
+                ])
+                .split(main_layout[1]);
+            let body_area = control_layout[1];
+
+            #[expect(clippy::cast_possible_truncation)]
+            frame.set_cursor_position(Position::new(
+                body_area.x + self.request_body_input.cursor_col() as u16 + 1,
+                body_area.y + self.request_body_input.cursor_row() as u16 + 1,
+            ));
+        }
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
-        if event::poll(Duration::from_millis(16))? {
+        if self.loading {
+            self.last_request_elapsed = self.last_request_intsant.elapsed();
+        }
+        if event::poll(Duration::from_millis(5))? {
             match event::read()? {
                 Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                     if self.url_input.focused {
-                        // Input mode: keys go to the text input
+                        // URL input mode
                         match key_event.code {
                             KeyCode::Esc => self.url_input.blur(),
                             code => {
@@ -176,12 +215,26 @@ impl<'a> App<'a> {
                                 }
                             }
                         }
+                    } else if self.request_body_input.focused {
+                        // Body input mode
+                        match key_event.code {
+                            KeyCode::Esc => self.request_body_input.blur(),
+                            code => {
+                                self.request_body_input.handle_key_event(code);
+                            }
+                        }
                     } else {
                         // Normal mode: resize, navigate, etc.
                         match key_event.code {
                             KeyCode::Char('q') => self.exit(),
-                            KeyCode::Char('u') => self.url_input.focus(),
-                            KeyCode::Char('b') => self.url_input.focus(),
+                            KeyCode::Char('u') => {
+                                self.request_body_input.blur();
+                                self.url_input.focus();
+                            }
+                            KeyCode::Char('b') => {
+                                self.url_input.blur();
+                                self.request_body_input.focus();
+                            }
                             KeyCode::Char('m') => self.switch_method(true),
                             KeyCode::Char('n') => self.switch_method(false),
                             KeyCode::Char('h') => self.help_window = !self.help_window,
@@ -300,7 +353,15 @@ impl Widget for &App<'_> {
             .requests_history
             .clone()
             .iter()
-            .map(|(k, v)| format!("{}: {} - {} in {:.0?}", v.method_str, self.format_short_url(k), v.status, v.elapsed))
+            .map(|(k, v)| {
+                format!(
+                    "{}: {} - {} in {:.0?}",
+                    v.method_str,
+                    self.format_short_url(k),
+                    v.status,
+                    v.elapsed
+                )
+            })
             .collect::<Vec<_>>();
 
         List::new(items)
@@ -380,18 +441,39 @@ impl Widget for &App<'_> {
 
         // Request body area
         let request_body_block = Block::bordered()
-            .title("Request Body")
+            .title("Request Body (b to edit)")
             .title_alignment(Alignment::Center)
             .title_style(Style::new().yellow())
-            .border_style(Style::default());
+            .border_style(if self.request_body_input.focused {
+                Style::new().yellow()
+            } else {
+                Style::default()
+            });
 
-        Paragraph::new("{ zxc }")
+        let body_style = if self.request_body_input.focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+
+        Paragraph::new(self.request_body_input.input.as_str())
+            .style(body_style)
             .block(request_body_block)
             .render(control_layout[1], buf);
 
+        let dot_or_not = if (self.last_request_elapsed.as_millis() / 120) % 2 == 0 {
+            "."
+        } else {
+            " "
+        };
+
         // Response area
         let response_title = if self.loading {
-            "Response [loading...]".to_string()
+            format!(
+                "loading..{} {:.0?}ms elapsed",
+                dot_or_not,
+                (self.last_request_elapsed.as_millis())
+            )
         } else if let Some(ref resp) = self.response {
             format!("Response in ({:.0?}) - [{}] ", resp.elapsed, resp.status,)
         } else {
