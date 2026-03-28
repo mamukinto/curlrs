@@ -13,8 +13,9 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position},
     style::{Color, Style, Stylize},
+    symbols,
     widgets::{
-        Block, BorderType, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Block, BorderType, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
         Widget, Wrap,
     },
 };
@@ -75,8 +76,8 @@ impl<'a> App<'a> {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             exit: false,
-            left_section_w: 25,
-            top_section_h: 30,
+            left_section_w: 40,
+            top_section_h: 40,
             help_window: true,
             url_input: TextInput::new("https://dogapi.dog/api/v2/breeds".to_string()),
             request_body_input: TextInput::new_multiline(
@@ -370,10 +371,6 @@ impl Widget for &App<'_> {
 
         // Sidebar
         let requests_block = Block::bordered()
-            .title("Requests History")
-            .title_position(ratatui::widgets::TitlePosition::Top)
-            .title_alignment(Alignment::Center)
-            .title_style(Style::new().yellow())
             .border_style(Style::default());
 
         let items = self
@@ -399,6 +396,14 @@ impl Widget for &App<'_> {
             .repeat_highlight_symbol(true)
             .render(sidebar_layout[0], buf);
 
+        Tabs::new(vec!["History", "Saved", "Settings"])
+            .style(Color::White)
+            .highlight_style(Style::default().yellow().bold())
+            // .select(self.selected_tab)
+            .divider("|")
+            .padding(" ", " ")
+            .render(sidebar_layout[0], buf);
+
         Paragraph::new(vec![
             "press <h>      to toggle this window"
                 .bold()
@@ -410,9 +415,7 @@ impl Widget for &App<'_> {
             "press <n>/<m>  to switch method back/forth".bold().into(),
             "press <enter>  to send request".bold().into(),
             "press <c>      to clear history".bold().into(),
-            "press <pgup/dn> to scroll response"
-                .bold()
-                .into(),
+            "press <pgup/dn> to scroll response".bold().into(),
             "press <esc>    to exit input mode"
                 .bold()
                 .light_red()
@@ -424,9 +427,8 @@ impl Widget for &App<'_> {
                 .title("Help")
                 .title_alignment(Alignment::Center)
                 .title_style(Style::new().yellow())
-                .border_type(BorderType::Double),
         )
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
         .alignment(Alignment::Left)
         .render(sidebar_layout[1], buf);
 
@@ -464,7 +466,7 @@ impl Widget for &App<'_> {
             .block(url_block)
             .render(url_and_method_layout[0], buf);
 
-        // htttp method area
+        // http method area
 
         let http_method_block = Block::bordered().title("method (m to edit)");
 
@@ -495,7 +497,7 @@ impl Widget for &App<'_> {
             self.request_body_input
                 .styled_text(body_style, body_sel_style),
         )
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
         .block(request_body_block)
         .render(control_layout[1], buf);
 
@@ -544,7 +546,7 @@ impl Widget for &App<'_> {
 
         Paragraph::new(response_text)
             .block(response_block)
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .scroll((self.response_scroll, 0))
             .render(response_area, buf);
 
