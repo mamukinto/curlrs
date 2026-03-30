@@ -17,8 +17,10 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position},
     style::{Color, Style, Stylize},
+    text::Span,
     widgets::{
-        Block, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Widget, Wrap,
+        Block, Clear, List, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
+        Widget, Wrap,
     },
 };
 
@@ -79,8 +81,20 @@ fn main() -> color_eyre::Result<()> {
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+    pub headers: Vec<(String, String)>,
     pub elapsed: Duration,
     pub method_str: String,
+}
+
+fn status_color(status: u16) -> Color {
+    match status {
+        200..=299 => Color::Green,
+        300..=399 => Color::Yellow,
+        400..=499 => Color::LightRed,
+        500..=599 => Color::Red,
+        0 => Color::Red, // connection error
+        _ => Color::White,
+    }
 }
 
 pub struct App<'a> {
@@ -104,6 +118,10 @@ pub struct App<'a> {
     history_selected: usize,
     saved_requests: Vec<SavedRequest>,
     saved_selected: usize,
+    show_response_headers: bool,
+    url_suggestions: Vec<String>,
+    url_suggestion_selected: usize,
+    show_suggestions: bool,
     rt: &'a tokio::runtime::Runtime,
     rx: mpsc::UnboundedReceiver<AppMessage>,
     tx: mpsc::UnboundedSender<AppMessage>,
@@ -117,10 +135,8 @@ impl<'a> App<'a> {
             left_section_w: 40,
             top_section_h: 40,
             help_window: true,
-            url_input: TextInput::new("https://dogapi.dog/api/v2/breeds".to_string()),
-            request_body_input: TextInput::new_multiline(
-                "{\n   \"id\": 1,\n   \"name\": \"boxy\"\n}".to_string(),
-            ),
+            url_input: TextInput::new(String::new()),
+            request_body_input: TextInput::new_multiline(String::new()),
             response: None,
             method: Method::GET,
             method_i: 0,
@@ -135,6 +151,10 @@ impl<'a> App<'a> {
             history_selected: 0,
             saved_requests: load_saved_requests(),
             saved_selected: 0,
+            show_response_headers: false,
+            url_suggestions: Vec::new(),
+            url_suggestion_selected: 0,
+            show_suggestions: false,
             rt,
             rx,
             tx,
@@ -146,20 +166,33 @@ impl<'a> App<'a> {
         self.response = None;
         let method = self.method.clone();
         let method_str = method.as_str().to_string();
+        let body = self.request_body_input.value().to_string();
         let tx = self.tx.clone();
         self.rt.spawn(async move {
             let client = reqwest::Client::new();
             let _ = tx.send(AppMessage::RequestStarted);
             let now = Instant::now();
-            let result = client.request(method, &url).send().await;
+            let mut req = client.request(method.clone(), &url);
+            if method != Method::GET && !body.is_empty() {
+                req = req.header("Content-Type", "application/json").body(body);
+            }
+            let result = req.send().await;
             let elapsed = now.elapsed();
             let resp = match result {
                 Ok(r) => {
                     let status = r.status().as_u16();
+                    let headers: Vec<(String, String)> = r
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                        })
+                        .collect();
                     let body = r.text().await.unwrap_or_else(|e| e.to_string());
                     HttpResponse {
                         status,
                         body,
+                        headers,
                         elapsed,
                         method_str,
                     }
@@ -167,6 +200,7 @@ impl<'a> App<'a> {
                 Err(e) => HttpResponse {
                     status: 0,
                     body: e.to_string(),
+                    headers: Vec::new(),
                     elapsed,
                     method_str,
                 },
@@ -229,6 +263,44 @@ impl<'a> App<'a> {
                 input_area.x + self.url_input.cursor as u16 + 1,
                 input_area.y + 1,
             ));
+
+            // Render URL suggestions dropdown
+            if self.show_suggestions && !self.url_suggestions.is_empty() {
+                let max_show = 6.min(self.url_suggestions.len()) as u16;
+                let popup_area = ratatui::layout::Rect {
+                    x: input_area.x,
+                    y: input_area.y + input_area.height,
+                    width: input_area.width,
+                    height: max_show + 2, // +2 for border
+                };
+
+                frame.render_widget(Clear, popup_area);
+
+                let items: Vec<ratatui::text::Line> = self
+                    .url_suggestions
+                    .iter()
+                    .take(6)
+                    .enumerate()
+                    .map(|(i, url)| {
+                        if i == self.url_suggestion_selected {
+                            ratatui::text::Line::from(format!("> {}", url))
+                                .style(Style::new().yellow().bold())
+                        } else {
+                            ratatui::text::Line::from(format!("  {}", url))
+                        }
+                    })
+                    .collect();
+
+                let popup_block = Block::bordered()
+                    .border_style(Style::new().dark_gray())
+                    .title_bottom(" tab:accept esc:dismiss ")
+                    .title_style(Style::new().dark_gray());
+
+                frame.render_widget(
+                    List::new(items).block(popup_block),
+                    popup_area,
+                );
+            }
         }
 
         // Cursor positioning for body input
@@ -269,13 +341,37 @@ impl<'a> App<'a> {
                     if self.url_input.focused {
                         // URL input mode
                         match key_event.code {
-                            KeyCode::Esc => self.url_input.blur(),
+                            KeyCode::Esc => {
+                                if self.show_suggestions {
+                                    self.show_suggestions = false;
+                                } else {
+                                    self.url_input.blur();
+                                }
+                            }
+                            KeyCode::Tab if self.show_suggestions => {
+                                self.accept_suggestion();
+                            }
+                            KeyCode::Down
+                                if self.show_suggestions
+                                    && !self.url_suggestions.is_empty() =>
+                            {
+                                self.url_suggestion_selected =
+                                    (self.url_suggestion_selected + 1)
+                                        .min(self.url_suggestions.len() - 1);
+                            }
+                            KeyCode::Up if self.show_suggestions => {
+                                self.url_suggestion_selected =
+                                    self.url_suggestion_selected.saturating_sub(1);
+                            }
                             _ => {
                                 if self.url_input.handle_key_event(key_event) {
+                                    self.show_suggestions = false;
                                     let url = self.url_input.value().to_string();
                                     if !url.is_empty() {
                                         self.send_request(url);
                                     }
+                                } else {
+                                    self.update_suggestions();
                                 }
                             }
                         }
@@ -331,6 +427,7 @@ impl<'a> App<'a> {
                                 match self.selected_tab {
                                     0 => self.load_from_history(),
                                     1 => self.load_from_saved(),
+                                    2 => self.load_sample_requests(),
                                     _ => {}
                                 }
                             }
@@ -380,6 +477,10 @@ impl<'a> App<'a> {
                                 self.request_body_input.focus();
                             }
                             KeyCode::Char('r') => self.save_response(),
+                            KeyCode::Char('t') => {
+                                self.show_response_headers = !self.show_response_headers;
+                                self.response_scroll = 0;
+                            }
                             KeyCode::Char('s') => {
                                 self.sidebar_focused = true;
                             }
@@ -448,6 +549,7 @@ impl<'a> App<'a> {
         HttpResponse {
             status: 1,
             body: String::new(),
+            headers: Vec::new(),
             elapsed: Duration::ZERO,
             method_str: String::new(),
         }
@@ -570,6 +672,108 @@ impl<'a> App<'a> {
         }
     }
 
+    fn update_suggestions(&mut self) {
+        let query = self.url_input.value().to_lowercase();
+        if query.is_empty() {
+            self.url_suggestions.clear();
+            self.show_suggestions = false;
+            return;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut suggestions = Vec::new();
+
+        // From history (most recent first)
+        for (url, _, _) in self.requests_history.iter().rev() {
+            if url.to_lowercase().contains(&query) && seen.insert(url.clone()) {
+                suggestions.push(url.clone());
+            }
+        }
+        // From saved
+        for saved in &self.saved_requests {
+            if saved.url.to_lowercase().contains(&query) && seen.insert(saved.url.clone()) {
+                suggestions.push(saved.url.clone());
+            }
+        }
+
+        // Don't show if only match is exact current input
+        if suggestions.len() == 1 && suggestions[0] == self.url_input.value() {
+            suggestions.clear();
+        }
+
+        self.show_suggestions = !suggestions.is_empty();
+        self.url_suggestion_selected = 0;
+        self.url_suggestions = suggestions;
+    }
+
+    fn accept_suggestion(&mut self) {
+        if let Some(url) = self.url_suggestions.get(self.url_suggestion_selected) {
+            self.url_input = TextInput::new(url.clone());
+            self.url_input.focus();
+            self.url_input.cursor = url.len();
+            self.url_suggestions.clear();
+            self.show_suggestions = false;
+        }
+    }
+
+    fn load_sample_requests(&mut self) {
+        let samples = vec![
+            SavedRequest {
+                name: "GET dogs".into(),
+                url: "https://dogapi.dog/api/v2/breeds".into(),
+                method_str: "GET".into(),
+                body: String::new(),
+            },
+            SavedRequest {
+                name: "GET random dog fact".into(),
+                url: "https://dogapi.dog/api/v2/facts?limit=1".into(),
+                method_str: "GET".into(),
+                body: String::new(),
+            },
+            SavedRequest {
+                name: "GET todos".into(),
+                url: "https://jsonplaceholder.typicode.com/todos/1".into(),
+                method_str: "GET".into(),
+                body: String::new(),
+            },
+            SavedRequest {
+                name: "POST create post".into(),
+                url: "https://jsonplaceholder.typicode.com/posts".into(),
+                method_str: "POST".into(),
+                body: "{\n  \"title\": \"hello\",\n  \"body\": \"world\",\n  \"userId\": 1\n}"
+                    .into(),
+            },
+            SavedRequest {
+                name: "PUT update post".into(),
+                url: "https://jsonplaceholder.typicode.com/posts/1".into(),
+                method_str: "PUT".into(),
+                body: "{\n  \"id\": 1,\n  \"title\": \"updated\",\n  \"body\": \"new body\",\n  \"userId\": 1\n}"
+                    .into(),
+            },
+            SavedRequest {
+                name: "DELETE post".into(),
+                url: "https://jsonplaceholder.typicode.com/posts/1".into(),
+                method_str: "DELETE".into(),
+                body: String::new(),
+            },
+            SavedRequest {
+                name: "GET IP info".into(),
+                url: "https://httpbin.org/ip".into(),
+                method_str: "GET".into(),
+                body: String::new(),
+            },
+            SavedRequest {
+                name: "GET headers echo".into(),
+                url: "https://httpbin.org/headers".into(),
+                method_str: "GET".into(),
+                body: String::new(),
+            },
+        ];
+        self.saved_requests.extend(samples);
+        persist_saved_requests(&self.saved_requests);
+        self.selected_tab = 1; // jump to Saved to show them
+    }
+
     fn exit(&mut self) {
         self.exit = true;
     }
@@ -649,18 +853,32 @@ impl Widget for &App<'_> {
                     .iter()
                     .enumerate()
                     .map(|(i, (url, _body, resp))| {
-                        let text = format!(
-                            "{} {} - {} {:.0?}ms",
-                            resp.method_str,
-                            self.format_short_url(url),
-                            resp.status,
-                            resp.elapsed.as_millis()
-                        );
-                        if self.sidebar_focused && i == self.history_selected {
-                            ratatui::text::Line::from(format!("> {}", text))
-                                .style(Style::new().yellow().bold())
+                        let prefix = if self.sidebar_focused && i == self.history_selected {
+                            "> "
                         } else {
-                            ratatui::text::Line::from(format!("  {}", text))
+                            "  "
+                        };
+                        let sc = status_color(resp.status);
+                        let line = ratatui::text::Line::from(vec![
+                            Span::raw(prefix),
+                            Span::styled(
+                                format!("{} ", resp.method_str),
+                                Style::new().bold(),
+                            ),
+                            Span::raw(format!("{} ", self.format_short_url(url))),
+                            Span::styled(
+                                format!("{}", resp.status),
+                                Style::new().fg(sc).bold(),
+                            ),
+                            Span::styled(
+                                format!(" {:.0?}ms", resp.elapsed.as_millis()),
+                                Style::new().dark_gray(),
+                            ),
+                        ]);
+                        if self.sidebar_focused && i == self.history_selected {
+                            line.style(Style::new().yellow().bold())
+                        } else {
+                            line
                         }
                     })
                     .collect();
@@ -700,9 +918,25 @@ impl Widget for &App<'_> {
             }
             2 => {
                 // Settings tab
+                let load_label = if self.sidebar_focused {
+                    ratatui::text::Line::from(
+                        "  > Load sample requests (Enter)"
+                    )
+                    .style(Style::new().yellow().bold())
+                } else {
+                    ratatui::text::Line::from(
+                        "  Load sample requests (focus sidebar, Enter)"
+                    )
+                    .style(Style::new().cyan())
+                };
+
                 let settings_text = vec![
                     ratatui::text::Line::from("  curlrs — Terminal HTTP Client")
                         .style(Style::new().yellow().bold()),
+                    ratatui::text::Line::from(""),
+                    load_label,
+                    ratatui::text::Line::from("  Adds 8 sample API requests to Saved")
+                        .style(Style::new().dark_gray()),
                     ratatui::text::Line::from(""),
                     ratatui::text::Line::from(format!(
                         "  Method:    {}",
@@ -746,6 +980,7 @@ impl Widget for &App<'_> {
             "press <enter>  to send request".bold().into(),
             "press <s>      to focus sidebar".bold().into(),
             "press <w>      to save current request".bold().into(),
+            "press <t>      to toggle response headers".bold().into(),
             "press <tab>    to switch sidebar tabs".bold().into(),
             "press <c>      to clear history".bold().into(),
             "press <pgup/dn> to scroll response".bold().into(),
@@ -899,76 +1134,97 @@ impl Widget for &App<'_> {
         }
 
         // Response area
-        let (response_title, response_text) = if let Some((_, _, _, resp_opt)) = preview {
-            match resp_opt {
-                Some(resp) => {
-                    let title = format!(
-                        "Response (preview) [{}] — RTT {}ms",
+        let active_resp: Option<&HttpResponse> = if let Some((_, _, _, resp_opt)) = preview {
+            resp_opt
+        } else {
+            self.response.as_ref()
+        };
+
+        let view_label = if self.show_response_headers {
+            "Headers"
+        } else {
+            "Body"
+        };
+
+        let (response_title, response_text, resp_status) = match active_resp {
+            Some(resp) => {
+                let title = if previewing {
+                    format!(
+                        "Response ({}) (preview) [{}] — RTT {}ms",
+                        view_label,
                         resp.status,
                         resp.elapsed.as_millis()
-                    );
-                    let value: serde_json::Value = serde_json::from_str(&resp.body)
-                        .unwrap_or(serde_json::Value::String(resp.body.clone()));
-                    let body =
-                        serde_json::to_string_pretty(&value).unwrap_or(resp.body.clone());
-                    (title, body)
-                }
-                None => ("Response (no history)".to_string(), String::new()),
-            }
-        } else {
-            let dot_or_not = if (self.last_request_elapsed.as_millis() / 125) % 2 == 0 {
-                "."
-            } else {
-                " "
-            };
-            let title = if self.loading {
-                format!(
-                    "loading..{} {:.0?}ms elapsed",
-                    dot_or_not,
-                    self.last_request_elapsed.as_millis()
-                )
-            } else if let Some(ref resp) = self.response {
-                format!(
-                    "Response [{}] — RTT {}ms | Total {}ms",
-                    resp.status,
-                    resp.elapsed.as_millis(),
-                    self.last_request_total.as_millis()
-                )
-            } else {
-                "Response".to_string()
-            };
-            let body = match &self.response {
-                Some(resp) => {
+                    )
+                } else {
+                    format!(
+                        "Response ({}) [{}] — RTT {}ms | Total {}ms",
+                        view_label,
+                        resp.status,
+                        resp.elapsed.as_millis(),
+                        self.last_request_total.as_millis()
+                    )
+                };
+                let text = if self.show_response_headers {
+                    resp.headers
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
                     let value: serde_json::Value = serde_json::from_str(&resp.body)
                         .unwrap_or(serde_json::Value::String(resp.body.clone()));
                     serde_json::to_string_pretty(&value).unwrap_or(resp.body.clone())
+                };
+                (title, text, Some(resp.status))
+            }
+            None => {
+                if self.loading {
+                    let dot_or_not =
+                        if (self.last_request_elapsed.as_millis() / 125) % 2 == 0 {
+                            "."
+                        } else {
+                            " "
+                        };
+                    (
+                        format!(
+                            "loading..{} {:.0?}ms elapsed",
+                            dot_or_not,
+                            self.last_request_elapsed.as_millis()
+                        ),
+                        String::new(),
+                        None,
+                    )
+                } else if previewing {
+                    ("Response (no history)".to_string(), String::new(), None)
+                } else {
+                    ("Response".to_string(), String::new(), None)
                 }
-                None => String::new(),
-            };
-            (title, body)
+            }
         };
 
-        let has_response = if previewing {
-            response_text.len() > 0
-        } else {
-            self.response.is_some()
-        };
+        let has_response = active_resp.is_some();
+
+        let status_style = resp_status
+            .map(|s| Style::new().fg(status_color(s)))
+            .unwrap_or(Style::new().yellow());
 
         let response_block = Block::bordered()
             .title(response_title)
             .title_alignment(Alignment::Center)
             .title_bottom(if has_response && !self.loading {
-                " r:save response "
+                " r:save t:headers "
             } else {
                 ""
             })
             .title_style(if previewing {
                 Style::new().cyan()
             } else {
-                Style::new().yellow()
+                status_style
             })
             .border_style(if previewing {
                 Style::new().cyan()
+            } else if let Some(s) = resp_status {
+                Style::new().fg(status_color(s))
             } else {
                 Style::default()
             });
