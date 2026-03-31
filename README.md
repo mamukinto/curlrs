@@ -27,14 +27,17 @@ cargo install --path .
 |-----|-------------|
 | `u` | Edit URL |
 | `b` | Edit request body |
+| `e` | Edit request headers |
+| `f` | Focus response body (navigate, select, copy) |
 | `m` / `n` | Cycle method forward/back |
 | `Enter` | Send request |
 | `s` | Focus sidebar |
 | `w` | Save current request |
 | `r` | Save response to file |
+| `t` | Toggle response headers |
 | `Tab` / `Shift+Tab` | Switch tabs |
 | `arrows` | Resize panes |
-| `PgUp/PgDn` | Scroll response |
+| `PgUp/PgDn` | Scroll body/response |
 | `c` | Clear history |
 | `h` | Toggle help |
 | `Esc` | Exit input/sidebar |
@@ -42,6 +45,18 @@ cargo install --path .
 
 When sidebar is focused: `Up/Down` to navigate, `Enter` to load, `d` to delete.
 
+## CLI
+
+```
+curlrs [url] [method]
+```
+
+Pre-fills URL and method. Example: `curlrs https://httpbin.org/ip GET`
+
 ## Stack
 
 Rust + [ratatui](https://github.com/ratatui/ratatui) + [reqwest](https://github.com/seanmonstar/reqwest) + [crossterm](https://github.com/crossterm-rs/crossterm) + tokio
+
+## Note
+
+Code needs refactoring. Last 50% written by Claude Opus 4.6.
